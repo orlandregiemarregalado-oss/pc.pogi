@@ -1,0 +1,112 @@
+# Re-registers the "\moonlight" scheduled task as SYSTEM with:
+#   - an event trigger (TS LocalSessionManager EventID 24, fires on every
+#     session disconnect on this machine) plus RemoteDisconnect
+#   - the robust fix script C:\Program Files (x86)\moonlight-fix.ps1
+# Run as Administrator.
+param(
+    [string]$OutputDirectory = $PSScriptRoot
+)
+
+$ErrorActionPreference = 'Stop'
+$outRoot   = $OutputDirectory
+$runLog    = Join-Path $outRoot 'setup-task.log'
+$errLog    = Join-Path $outRoot 'setup-task-error.log'
+$fixScript = Join-Path $outRoot 'fix-moonlight-auto.ps1'
+$manualBat = Join-Path $outRoot 'fix-moonlight-after-rdp.bat'
+$installFix  = 'C:\Program Files (x86)\moonlight-fix.ps1'
+$installBat  = 'C:\Program Files (x86)\moonlight.bat'
+
+try {
+Remove-Item -LiteralPath $runLog, $errLog -ErrorAction SilentlyContinue
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'Please run this script as Administrator.' -ForegroundColor Red
+    exit 1
+}
+
+function Write-RunLog([string]$msg) {
+    Add-Content -LiteralPath $runLog -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
+}
+
+# 1. Remove the earlier duplicate task (ignore if it does not exist).
+try { schtasks /delete /tn "MoonlightFixAfterRDP" /f 2>&1 | Out-Null } catch { }
+Write-RunLog 'Removed duplicate task MoonlightFixAfterRDP (if present).'
+
+# 2. Install the robust scripts into Program Files (x86).
+Copy-Item -LiteralPath $fixScript -Destination $installFix -Force
+Copy-Item -LiteralPath $manualBat -Destination $installBat -Force
+Write-RunLog "Installed $installFix and $installBat"
+
+# Clear any stale dedup guard so the next real disconnect runs a fresh fix.
+Remove-Item -LiteralPath (Join-Path $env:TEMP 'moonlight-fix.guard') -ErrorAction SilentlyContinue
+Write-RunLog 'Cleared stale dedup guard.'
+
+# 3. Re-register "\moonlight" as SYSTEM with both triggers.
+$xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>After an RDP disconnect, reconnect the session to the console so Moonlight keeps working.</Description>
+    <Author>moonlight-rdp-fix</Author>
+  </RegistrationInfo>
+  <Triggers>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"&gt;&lt;Select Path="Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"&gt;*[System[(EventID=24)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <Delay>PT10S</Delay>
+    </EventTrigger>
+    <SessionStateChangeTrigger>
+      <Enabled>true</Enabled>
+      <StateChange>RemoteDisconnect</StateChange>
+      <Delay>PT10S</Delay>
+    </SessionStateChangeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Program Files (x86)\moonlight-fix.ps1"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+$xmlPath = Join-Path $env:TEMP 'moonlight-task.xml'
+$xml | Set-Content -LiteralPath $xmlPath -Encoding Unicode
+
+schtasks /create /tn "\moonlight" /xml $xmlPath /ru SYSTEM /f
+if ($LASTEXITCODE -ne 0) { throw "schtasks /create failed with exit code $LASTEXITCODE" }
+
+$final = Get-ScheduledTask -TaskName 'moonlight'
+Write-RunLog ("Task registered. State=" + $final.State + " Principal=" + $final.Principal.UserId)
+Write-RunLog ("Triggers: " + (($final.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', '))
+Write-RunLog ("Action: " + $final.Actions[0].Execute + ' ' + $final.Actions[0].Arguments)
+
+} catch {
+    $_ | Out-File -LiteralPath $errLog -Encoding UTF8
+    exit 1
+}
